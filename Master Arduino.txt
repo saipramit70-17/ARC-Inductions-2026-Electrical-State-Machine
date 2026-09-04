@@ -1,0 +1,522 @@
+// Master Arduino
+#include <Wire.h>
+#include <Servo.h>
+
+const int TEMP_PIN = A0;
+const int GAS_PIN = A1;
+const int LDR_PIN = A2;
+
+const int BUZZER_PIN = 8;
+const int SERVO_PIN = 9;
+
+const byte SLAVE_ADDRESS = 8;
+
+const byte STANDBY = 0;
+const byte ACTIVE = 1;
+const byte GAS_ALERT = 2;
+const byte BLACKOUT = 3;
+const byte TEMP_EMERGENCY = 4;
+
+byte currentState = STANDBY;
+
+const byte ACTIVATE_CMD = 0x10;
+const byte RESET_CMD = 0x12;
+
+int previousLight;
+
+Servo servo;
+
+
+// =================================================
+// TEMPERATURE
+// =================================================
+
+float readTemperature() {
+
+  int raw = analogRead(TEMP_PIN);
+
+  float voltage = raw * 5.0 / 1023.0;
+
+  return (voltage - 0.5) * 100.0;
+}
+
+
+// =================================================
+// SEND DATA TO SLAVE
+// =================================================
+
+void sendDataToSlave() {
+
+  int lightValue = analogRead(LDR_PIN);
+  int gasValue = analogRead(GAS_PIN);
+
+  Wire.beginTransmission(SLAVE_ADDRESS);
+
+  Wire.write(currentState);
+
+  Wire.write(highByte(lightValue));
+  Wire.write(lowByte(lightValue));
+
+  Wire.write(highByte(gasValue));
+  Wire.write(lowByte(gasValue));
+
+  Wire.endTransmission();
+}
+
+
+// =================================================
+// REMOTE COMMAND
+// =================================================
+
+void checkRemoteCommand() {
+
+  Wire.requestFrom(SLAVE_ADDRESS, (byte)1);
+
+  if (Wire.available()) {
+
+    byte command = Wire.read();
+
+    if (command == ACTIVATE_CMD &&
+        currentState == STANDBY) {
+
+      currentState = ACTIVE;
+
+      Serial.println("SYSTEM ACTIVATED");
+    }
+
+    else if (command == RESET_CMD &&
+             currentState == TEMP_EMERGENCY) {
+
+      currentState = ACTIVE;
+
+      servo.write(0);
+
+      noTone(BUZZER_PIN);
+
+      Serial.println("TEMPERATURE RESET");
+    }
+  }
+}
+
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  Wire.begin();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  servo.attach(SERVO_PIN);
+
+  servo.write(0);
+
+  previousLight = analogRead(LDR_PIN);
+
+  Serial.println("MASTER READY");
+
+  sendDataToSlave();
+}
+
+
+// =================================================
+// MAIN LOOP
+// =================================================
+
+void loop() {
+
+  checkRemoteCommand();
+
+
+  // READ SENSORS
+
+  int lightValue = analogRead(LDR_PIN);
+
+  int gasValue = analogRead(GAS_PIN);
+
+  float temperature = readTemperature();
+
+
+  // =================================================
+  // BLACKOUT DETECTION
+  // =================================================
+
+  bool blackout = false;
+
+  if (previousLight > 200 &&
+      lightValue < 100) {
+
+    blackout = true;
+  }
+
+
+  // =================================================
+  // TEMPERATURE EMERGENCY
+  // =================================================
+
+  if (temperature > 45.0) {
+
+    currentState = TEMP_EMERGENCY;
+
+    servo.write(180);
+
+    noTone(BUZZER_PIN);
+  }
+
+
+  // =================================================
+  // WAIT FOR TEMPERATURE RESET
+  // =================================================
+
+  else if (currentState == TEMP_EMERGENCY) {
+
+    servo.write(180);
+
+    noTone(BUZZER_PIN);
+  }
+
+
+  // =================================================
+  // SYSTEM ACTIVE
+  // =================================================
+
+  else if (currentState != STANDBY) {
+
+
+    // =================================================
+    // MULTI-FAULT
+    // GAS + BLACKOUT
+    // =================================================
+
+    if (gasValue > 180 &&
+        blackout) {
+
+      currentState = GAS_ALERT;
+
+      tone(BUZZER_PIN, 1000);
+    }
+
+
+    // =================================================
+    // GAS ALERT
+    // =================================================
+
+    else if (currentState == GAS_ALERT) {
+
+      if (gasValue < 130) {
+
+        noTone(BUZZER_PIN);
+
+        currentState = ACTIVE;
+      }
+
+      else {
+
+        tone(BUZZER_PIN, 1000);
+      }
+    }
+
+
+    // =================================================
+    // NEW GAS ALERT
+    // =================================================
+
+    else if (gasValue > 180) {
+
+      currentState = GAS_ALERT;
+
+      noTone(BUZZER_PIN);
+    }
+
+
+    // =================================================
+    // BLACKOUT
+    // =================================================
+
+    else if (blackout) {
+
+      currentState = BLACKOUT;
+
+      noTone(BUZZER_PIN);
+    }
+
+
+    // =================================================
+    // NORMAL
+    // =================================================
+
+    else {
+
+      currentState = ACTIVE;
+
+      noTone(BUZZER_PIN);
+    }
+  }
+
+
+  // =================================================
+  // SERVO
+  // =================================================
+
+  if (currentState != TEMP_EMERGENCY) {
+
+    servo.write(0);
+  }
+
+
+  // =================================================
+  // SEND DATA
+  // =================================================
+
+  sendDataToSlave();
+
+
+  // =================================================
+  // SERIAL MONITOR
+  // =================================================
+
+  Serial.print("State: ");
+  Serial.print(currentState);
+
+  Serial.print(" | Temp: ");
+  Serial.print(temperature);
+
+  Serial.print(" | Gas: ");
+  Serial.print(gasValue);
+
+  Serial.print(" | Light: ");
+  Serial.print(lightValue);
+
+  Serial.print(" | Previous: ");
+  Serial.println(previousLight);
+
+
+  // Update previous light
+
+  previousLight = lightValue;
+
+  delay(100);
+}
+
+//Slave Arduino
+#include <Wire.h>
+#include <IRremote.h>
+#include <LiquidCrystal.h>
+
+// ---------- LCD ----------
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+// ---------- IR ----------
+const int IR_PIN = 10;
+
+// ---------- I2C ----------
+const byte SLAVE_ADDRESS = 8;
+
+// ---------- Remote commands ----------
+const byte ACTIVATE_CMD = 0x10;
+const byte TOGGLE_CMD   = 0x11;
+const byte RESET_CMD    = 0x12;
+
+// ---------- Data from Master ----------
+volatile byte currentState = 0;
+volatile int lightValue = 0;
+volatile int gasValue = 0;
+
+// Command waiting to be collected by Master
+volatile byte pendingCommand = 0;
+
+bool showLight = true;
+
+byte oldState = 255;
+int oldLight = -1;
+int oldGas = -1;
+bool oldShowLight = true;
+
+
+// =================================================
+// MASTER SENDS DATA TO SLAVE
+// =================================================
+
+void receiveEvent(int howMany) {
+
+  if (howMany >= 5) {
+
+    byte newState = Wire.read();
+
+    int newLight = Wire.read() << 8;
+    newLight |= Wire.read();
+
+    int newGas = Wire.read() << 8;
+    newGas |= Wire.read();
+
+    currentState = newState;
+    lightValue = newLight;
+    gasValue = newGas;
+  }
+
+  // Clear anything extra
+  while (Wire.available()) {
+    Wire.read();
+  }
+}
+
+
+// =================================================
+// MASTER REQUESTS COMMAND FROM SLAVE
+// =================================================
+
+void requestEvent() {
+
+  Wire.write(pendingCommand);
+
+  pendingCommand = 0;
+}
+
+
+// =================================================
+// UPDATE LCD
+// =================================================
+
+void updateLCD() {
+
+  if (currentState == oldState &&
+      lightValue == oldLight &&
+      gasValue == oldGas &&
+      showLight == oldShowLight) {
+    return;
+  }
+
+  lcd.clear();
+
+  switch (currentState) {
+
+    case 0:
+      lcd.setCursor(0, 0);
+      lcd.print("AWAITING");
+      lcd.setCursor(0, 1);
+      lcd.print("RITUAL");
+      break;
+
+    case 1:
+
+      lcd.setCursor(0, 0);
+
+      if (showLight) {
+        lcd.print("LIGHT: ");
+        lcd.print(lightValue);
+      }
+      else {
+        lcd.print("GAS: ");
+        lcd.print(gasValue);
+      }
+
+      lcd.setCursor(0, 1);
+      lcd.print("MONITORING");
+
+      break;
+
+    case 2:
+      lcd.setCursor(0, 0);
+      lcd.print("TOXIC PURGE");
+      break;
+
+    case 3:
+      lcd.setCursor(0, 0);
+      lcd.print("NOCTIS");
+      lcd.setCursor(0, 1);
+      lcd.print("PROTOCOL");
+      break;
+
+    case 4:
+      lcd.setCursor(0, 0);
+      lcd.print("COOKED");
+      break;
+  }
+
+  oldState = currentState;
+  oldLight = lightValue;
+  oldGas = gasValue;
+  oldShowLight = showLight;
+}
+
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  lcd.begin(16, 2);
+
+  // Slave address
+  Wire.begin(SLAVE_ADDRESS);
+
+  Wire.onReceive(receiveEvent);
+  Wire.onRequest(requestEvent);
+
+  // IR receiver
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("AWAITING");
+  lcd.setCursor(0, 1);
+  lcd.print("RITUAL");
+
+  Serial.println("SLAVE READY");
+}
+
+
+// =================================================
+// LOOP
+// =================================================
+
+void loop() {
+
+  // ---------- IR REMOTE ----------
+
+  if (IrReceiver.decode()) {
+
+    byte command = IrReceiver.decodedIRData.command;
+
+    Serial.print("IR COMMAND: 0x");
+    Serial.println(command, HEX);
+
+    if (command == ACTIVATE_CMD) {
+
+      pendingCommand = ACTIVATE_CMD;
+
+      Serial.println("ACTIVATE COMMAND READY");
+    }
+
+    else if (command == TOGGLE_CMD) {
+
+      showLight = !showLight;
+
+      Serial.println("DISPLAY TOGGLED");
+    }
+
+    else if (command == RESET_CMD) {
+
+      pendingCommand = RESET_CMD;
+
+      Serial.println("RESET COMMAND READY");
+    }
+
+    IrReceiver.resume();
+  }
+
+  updateLCD();
+
+  delay(20);
+}
+
+
+
+// Link to tinkercad https://www.tinkercad.com/things/ggy81NFg4GW-ingenious-juttuli-bombul/editel?returnTo=https%3A%2F%2Fwww.tinkercad.com%2Fdashboard%2Fdesigns%2Fcircuits
